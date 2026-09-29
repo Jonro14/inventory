@@ -1,9 +1,9 @@
 // Service worker: lets the app open without internet.
 // App files: network first (updates arrive as soon as they are online), cache as fallback.
-// Libraries from gstatic / jsdelivr (versioned, never change): cache first.
+// Firebase libraries from gstatic (versioned, never change): cache first.
 // Firestore traffic is not touched (Firestore keeps its own offline copy).
 
-const CACHE = 'home-inventory-v1';
+const CACHE = 'home-inventory-v2';
 const SHELL = [
   './',
   './index.html',
@@ -16,7 +16,7 @@ const SHELL = [
   './icons/icon.svg',
   './icons/icon-192.png',
 ];
-const LIB_HOSTS = ['www.gstatic.com', 'cdn.jsdelivr.net'];
+const LIB_HOSTS = ['www.gstatic.com'];
 
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));

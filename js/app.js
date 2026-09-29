@@ -1,12 +1,14 @@
 // Home Inventory - user interface.
 // Views (hash routes): #/ home map, #/unit/<id>, #/slot/<id>, #/labels, #/settings.
 // Typing in the search box shows results on top of whatever view is open.
+//
+// Places: floor > room > unit (closet, drawers, box) > slot (shelf, named, editable).
+// A slot marked "blocked" (e.g. hanging jackets) is drawn but nothing can be stored in it.
+// An item can hold a list of objects (contents), which the search also finds.
 
 import { createStore } from './store.js';
 import { buildSeed } from './seed.js';
 
-const JSQR_URL = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';
-const QRGEN_URL = 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js';
 const COLLECTIONS = ['units', 'slots', 'items'];
 
 // ---------------------------------------------------------------- helpers
@@ -35,17 +37,6 @@ function ago(ts) {
   if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
   if (s < 86400 * 7) return plural(Math.floor(s / 86400), 'day') + ' ago';
   return new Date(ts).toLocaleDateString();
-}
-
-const scriptCache = {};
-function loadScript(url) {
-  return (scriptCache[url] ||= new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = url;
-    s.onload = resolve;
-    s.onerror = () => { delete scriptCache[url]; reject(new Error('Could not load ' + url)); };
-    document.head.appendChild(s);
-  }));
 }
 
 function download(filename, text, type) {
@@ -99,16 +90,19 @@ let D = {};            // derived indexes, rebuilt on every data change
 let store;
 let unsubscribers = [];
 
+const floorOf = u => u.floor || 'Other';
+const roomOf = u => u.room || 'Other';
+// Shelves saved by the first version of the app had a tag + label instead of a name.
+const slotName = s => (s ? s.name || s.label || s.tag || 'Shelf' : '?');
+
 function derive() {
   const slotsByUnit = new Map();
   const itemsBySlot = new Map();
-  const slotByTag = new Map();
   for (const s of S.slots.values()) {
     if (!slotsByUnit.has(s.unitId)) slotsByUnit.set(s.unitId, []);
     slotsByUnit.get(s.unitId).push(s);
-    slotByTag.set(norm(s.tag), s);
   }
-  for (const list of slotsByUnit.values()) list.sort((a, b) => a.row - b.row || a.col - b.col);
+  for (const list of slotsByUnit.values()) list.sort((a, b) => natural(slotName(a), slotName(b)) || a.row - b.row || a.col - b.col);
   for (const it of S.items.values()) {
     if (!itemsBySlot.has(it.slotId)) itemsBySlot.set(it.slotId, []);
     itemsBySlot.get(it.slotId).push(it);
@@ -116,25 +110,43 @@ function derive() {
   for (const list of itemsBySlot.values()) list.sort((a, b) => natural(a.name, b.name));
 
   const units = [...S.units.values()].sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || natural(a.name, b.name));
-  const rooms = new Map();
+  // floor -> room -> units, in the order of the first unit of each (so "First floor" comes first).
+  const floors = new Map();
   for (const u of units) {
-    const room = u.room || 'Other';
-    if (!rooms.has(room)) rooms.set(room, []);
-    rooms.get(room).push(u);
+    const f = floorOf(u);
+    if (!floors.has(f)) floors.set(f, new Map());
+    const rooms = floors.get(f);
+    if (!rooms.has(roomOf(u))) rooms.set(roomOf(u), []);
+    rooms.get(roomOf(u)).push(u);
   }
   const categories = [...new Set([...S.items.values()].map(i => i.category).filter(Boolean))].sort(natural);
-  const allSlots = [...S.slots.values()].sort((a, b) => natural(a.tag, b.tag));
-  D = { slotsByUnit, itemsBySlot, slotByTag, units, rooms, categories, allSlots };
+  const shelves = units.flatMap(u => (slotsByUnit.get(u.id) || []).filter(s => !s.blocked));
+  D = { slotsByUnit, itemsBySlot, units, floors, categories, shelves };
 }
 
 const itemsInSlot = id => D.itemsBySlot.get(id) || [];
 const slotsInUnit = id => D.slotsByUnit.get(id) || [];
+const shelvesInUnit = id => slotsInUnit(id).filter(s => !s.blocked);
 const itemsInUnit = id => slotsInUnit(id).reduce((n, s) => n + itemsInSlot(s.id).length, 0);
-const unitLabel = u => (u ? `${u.room ? u.room + ' · ' : ''}${u.name}` : '?');
+// Room names repeat on both floors (Hall, Bedroom), so the floor is part of the place.
+const shortFloor = f => ({ 'First floor': '1st floor', 'Second floor': '2nd floor' }[f] || f);
+const unitLabel = u => (u ? [u.floor && shortFloor(u.floor), u.room, u.name].filter(Boolean).join(' · ') : '?');
 
 function slotPlace(slot) {
   const u = slot && S.units.get(slot.unitId);
   return u ? unitLabel(u) : 'Unknown place';
+}
+
+// "Shelf 3 · 1st floor · Storage room · Storage closet" (the shelf name is left out when it
+// just repeats the closet name, e.g. "Memories box").
+function fullPlace(slot) {
+  const u = slot && S.units.get(slot.unitId);
+  if (!u) return 'Unknown place';
+  return norm(slotName(slot)) === norm(u.name) ? unitLabel(u) : `${slotName(slot)} · ${unitLabel(u)}`;
+}
+
+function contentsText(it) {
+  return (it.contents || []).map(c => ((c.qty ?? 1) !== 1 ? `${c.qty} ${c.name}` : c.name)).join(', ');
 }
 
 function stamp() {
@@ -217,7 +229,7 @@ function render(force = false) {
     switch (r.name) {
       case 'slot': view.innerHTML = slotHTML(r.id); break;
       case 'unit': view.innerHTML = unitHTML(r.id); break;
-      case 'labels': view.innerHTML = labelsHTML(r.params.get('slot')); fillQRCodes(); break;
+      case 'labels': view.innerHTML = labelsHTML(r.params.get('slot')); break;
       case 'settings': view.innerHTML = settingsHTML(); break;
       default: view.innerHTML = homeHTML();
     }
@@ -267,9 +279,11 @@ function welcomeHTML() {
   return `
   <div class="card welcome">
     <h1>Welcome</h1>
-    <p>Start with our house already drawn: storage closet (A1–A20), bedroom closet (H1–H9),
-    vertical drawers (D1–D4), the 3 bathrooms with 2 closets each, the two empty walk-in rooms and the memories box.</p>
-    <p class="muted">The grids are a first guess. Everything can be rearranged later with <b>Edit layout</b>.</p>
+    <p>Start with our house already drawn.
+    <b>First floor:</b> storage room (storage closet + extras), bathroom 1, bedroom closet and the memories box in the hall.
+    <b>Second floor:</b> vertical drawers in the hall, the bedroom walk-in room, the master bedroom closet and walk-in room,
+    the master bathroom, the shower and the terrace.</p>
+    <p class="muted">Every shelf has a name you can change. Everything can be rearranged later with <b>Edit layout</b>.</p>
     <div class="actions">
       <button class="btn primary" data-act="load-seed">Load our house layout</button>
       <button class="btn" data-act="new-unit">Start from scratch</button>
@@ -297,14 +311,22 @@ function gridHTML(u, o = {}) {
   for (const s of slots) {
     for (let r = s.row; r < s.row + (s.rowSpan || 1); r++)
       for (let c = s.col; c < s.col + (s.colSpan || 1); c++) taken.add(r + ',' + c);
+    const area = `grid-row:${s.row}/span ${s.rowSpan || 1};grid-column:${s.col}/span ${s.colSpan || 1}`;
+    if (s.blocked) {
+      // Drawn, but nothing can be stored here. Only clickable while editing the layout.
+      const inner = o.mini ? '' : `<span class="cname">${esc(slotName(s))}</span>`;
+      cells += o.edit
+        ? `<button type="button" class="cell blocked editing" data-slot="${s.id}" title="${esc(slotName(s))}" style="${area}">${inner}</button>`
+        : `<div class="cell blocked" title="${esc(slotName(s))}" style="${area}">${inner}</div>`;
+      continue;
+    }
     const n = itemsInSlot(s.id).length;
     const cls = ['cell', n ? 'has' : 'empty', o.highlight === s.id ? 'hl' : '', o.edit ? 'editing' : ''].join(' ');
     const attr = o.pick ? `data-pick="${s.id}"` : `data-slot="${s.id}"`;
-    const title = [s.tag, s.label, plural(n, 'item')].filter(Boolean).join(' · ');
-    cells += `<button type="button" class="${cls}" ${attr} title="${esc(title)}" style="grid-row:${s.row}/span ${s.rowSpan || 1};grid-column:${s.col}/span ${s.colSpan || 1}">`
-      + `<span class="ctag">${esc(s.tag)}</span>`
+    const title = [slotName(s), plural(n, 'item')].join(' · ');
+    cells += `<button type="button" class="${cls}" ${attr} title="${esc(title)}" style="${area}">`
+      + (o.mini ? '' : `<span class="cname">${esc(slotName(s))}</span>`)
       + (n ? `<span class="ccount">${n}</span>` : '')
-      + (!o.mini && s.label ? `<span class="clabel">${esc(s.label)}</span>` : '')
       + `</button>`;
   }
   for (let r = 1; r <= rows; r++) {
@@ -326,20 +348,24 @@ function homeHTML() {
   if (!D.units.length) return welcomeHTML();
   let h = `<div class="summary">
     <span><b>${S.items.size}</b> items</span>
-    <span><b>${S.slots.size}</b> shelves</span>
+    <span><b>${D.shelves.length}</b> shelves</span>
     <span><b>${D.units.length}</b> closets</span>
   </div>`;
-  for (const [room, units] of D.rooms) {
-    h += `<section class="room"><h2>${esc(room)}</h2><div class="units">`;
-    for (const u of units) {
-      const n = itemsInUnit(u.id);
-      const hasSlots = slotsInUnit(u.id).length > 0;
-      h += `<article class="unit-card" style="--cols:${unitCols(u)}">
-        <a class="unit-head" href="#/unit/${u.id}"><span class="unit-name">${esc(u.name)}</span><span class="muted small">${n || ''}</span></a>
-        ${hasSlots ? gridHTML(u, { mini: true, scale: 0.9 }) : `<a class="empty-unit" href="#/unit/${u.id}">No shelves yet<br><small>tap to set up</small></a>`}
-      </article>`;
+  for (const [floor, rooms] of D.floors) {
+    h += `<section class="floor"><h2 class="floor-title">${esc(floor)}</h2>`;
+    for (const [room, units] of rooms) {
+      h += `<section class="room"><h3>${esc(room)}</h3><div class="units">`;
+      for (const u of units) {
+        const n = itemsInUnit(u.id);
+        const hasSlots = slotsInUnit(u.id).length > 0;
+        h += `<article class="unit-card" style="--cols:${unitCols(u)}">
+          <a class="unit-head" href="#/unit/${u.id}"><span class="unit-name">${esc(u.name)}</span><span class="muted small">${n || ''}</span></a>
+          ${hasSlots ? gridHTML(u, { mini: true, scale: 0.9 }) : `<a class="empty-unit" href="#/unit/${u.id}">No shelves yet<br><small>tap to set up</small></a>`}
+        </article>`;
+      }
+      h += `</div></section>`;
     }
-    h += `</div></section>`;
+    h += `</section>`;
   }
   const recent = [...S.items.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 6);
   if (recent.length) {
@@ -356,8 +382,12 @@ function itemRowHTML(it, o = {}) {
     ? `<button type="button" class="thumb" data-act="photo" data-id="${it.id}" aria-label="View photo"><img src="${it.thumb}" alt=""></button>`
     : `<span class="thumb ph" aria-hidden="true">${esc((it.name || '?').charAt(0).toUpperCase())}</span>`;
   const where = o.where && slot
-    ? `<span class="where"><span class="tag-chip">${esc(slot.tag)}</span>${esc(slotPlace(slot))}${slot.label ? ' · ' + esc(slot.label) : ''}</span>`
+    ? `<span class="where"><svg class="pin" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7-6.2-7-11.5a7 7 0 0 1 14 0C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/></svg>${esc(fullPlace(slot))}</span>`
     : '';
+  // Search results show which objects inside matched; elsewhere the whole list, shortened.
+  const inside = o.matched?.length
+    ? `<span class="inside">Inside: ${o.matched.map(c => `<b>${esc((c.qty ?? 1) !== 1 ? `${c.qty} ${c.name}` : c.name)}</b>`).join(', ')}</span>`
+    : (it.contents?.length ? `<span class="inside clip">Inside: ${esc(contentsText(it))}</span>` : '');
   const main = o.where
     ? `<button type="button" class="item-main" data-act="goto-item" data-id="${it.id}">`
     : `<button type="button" class="item-main" data-act="edit-item" data-id="${it.id}">`;
@@ -370,7 +400,7 @@ function itemRowHTML(it, o = {}) {
       </div>`;
   return `<li class="item-row" id="item-${it.id}">
     ${thumb}
-    ${main}<span class="item-name">${esc(it.name)}</span>${sub ? `<span class="muted small clip">${esc(sub)}</span>` : ''}${where}</button>
+    ${main}<span class="item-name">${esc(it.name)}</span>${sub ? `<span class="muted small clip">${esc(sub)}</span>` : ''}${inside}${where}</button>
     ${qty}
   </li>`;
 }
@@ -379,9 +409,10 @@ function searchHTML(q) {
   const terms = norm(q).split(/\s+/).filter(Boolean);
   const matchAll = hay => terms.every(t => hay.includes(t));
 
-  const slotHits = D.allSlots.filter(s => {
+  // Shelves whose own name matches (not only their closet, or every shelf of a closet would show).
+  const slotHits = D.shelves.filter(s => {
     const u = S.units.get(s.unitId);
-    return norm(s.tag).startsWith(terms.join('')) || (terms.length && matchAll(norm(`${s.tag} ${s.label} ${u?.name} ${u?.room}`)) && s.label);
+    return terms.some(t => norm(slotName(s)).includes(t)) && matchAll(norm(`${slotName(s)} ${u?.name} ${u?.room} ${u?.floor}`));
   }).slice(0, 12);
 
   const itemHits = [];
@@ -389,21 +420,23 @@ function searchHTML(q) {
     const slot = S.slots.get(it.slotId);
     const u = slot && S.units.get(slot.unitId);
     const name = norm(it.name);
-    const hay = `${name} ${norm(it.category)} ${norm(it.notes)} ${norm(slot?.tag)} ${norm(slot?.label)} ${norm(u?.name)} ${norm(u?.room)}`;
+    const contents = it.contents || [];
+    const hay = `${name} ${norm(it.category)} ${norm(it.notes)} ${contents.map(c => norm(c.name)).join(' ')} ${norm(slotName(slot))} ${norm(u?.name)} ${norm(u?.room)} ${norm(u?.floor)}`;
     if (!matchAll(hay)) continue;
-    const score = name.startsWith(terms[0]) ? 3 : name.includes(terms[0]) ? 2 : 1;
-    itemHits.push({ it, score });
+    const matched = contents.filter(c => terms.some(t => norm(c.name).includes(t)));
+    const score = name.startsWith(terms[0]) ? 3 : (name.includes(terms[0]) || matched.length) ? 2 : 1;
+    itemHits.push({ it, score, matched });
   }
   itemHits.sort((a, b) => b.score - a.score || natural(a.it.name, b.it.name));
 
   let h = '';
   if (slotHits.length) {
     h += `<section class="room"><h2>Shelves</h2><div class="chips">${slotHits.map(s =>
-      `<a class="chip" href="#/slot/${s.id}"><span class="tag-chip">${esc(s.tag)}</span>${esc(s.label || slotPlace(s))}</a>`).join('')}</div></section>`;
+      `<a class="chip" href="#/slot/${s.id}"><b>${esc(slotName(s))}</b><span class="muted">${esc(slotPlace(s))}</span></a>`).join('')}</div></section>`;
   }
   h += `<section class="room"><h2>Items <span class="muted">(${itemHits.length})</span></h2>`;
   h += itemHits.length
-    ? `<ul class="list">${itemHits.slice(0, 150).map(x => itemRowHTML(x.it, { where: true, stepper: false })).join('')}</ul>`
+    ? `<ul class="list">${itemHits.slice(0, 150).map(x => itemRowHTML(x.it, { where: true, stepper: false, matched: x.matched })).join('')}</ul>`
     : `<p class="empty">Nothing found for “${esc(q)}”.</p>`;
   h += `</section>`;
   return h;
@@ -417,16 +450,15 @@ function dimsText(s) {
 
 function slotHTML(id) {
   const s = S.slots.get(id);
-  if (!s) return `<div class="card"><p>This shelf does not exist any more.</p><a class="btn" href="#/">Home</a></div>`;
+  if (!s || s.blocked) return `<div class="card"><p>This shelf does not exist any more.</p><a class="btn" href="#/">Home</a></div>`;
   const u = S.units.get(s.unitId);
   const items = itemsInSlot(id);
   return `
   <nav class="crumbs"><a href="#/">Home</a><span>›</span><a href="#/unit/${u?.id}">${esc(unitLabel(u))}</a></nav>
   <div class="slot-head">
-    <div class="tag-big">${esc(s.tag)}</div>
     <div class="slot-meta">
-      <input class="inline-input" data-field="slot-label" data-id="${id}" value="${esc(s.label)}" placeholder="Add a label, e.g. Winter clothes" maxlength="60" aria-label="Shelf label">
-      <div class="muted small">${dimsText(s)}${s.note ? ' · ' + esc(s.note) : ''}</div>
+      <input class="inline-input slot-name" data-field="slot-name" data-id="${id}" value="${esc(slotName(s))}" placeholder="Shelf name, e.g. Winter clothes" maxlength="60" aria-label="Shelf name (tap to change)">
+      <div class="muted small">Tap the name to change it · ${dimsText(s)}${s.note ? ' · ' + esc(s.note) : ''}</div>
     </div>
   </div>
   <div class="slot-body">
@@ -456,7 +488,7 @@ function unitHTML(id) {
   const lastRowUsed = slots.some(s => s.row + (s.rowSpan || 1) - 1 >= (u.rows || 1));
   const lastColUsed = slots.some(s => s.col + (s.colSpan || 1) - 1 >= (u.cols || 1));
   return `
-  <nav class="crumbs"><a href="#/">Home</a><span>›</span><span>${esc(u.room || 'Other')}</span></nav>
+  <nav class="crumbs"><a href="#/">Home</a><span>›</span><span>${esc(floorOf(u))}</span><span>›</span><span>${esc(roomOf(u))}</span></nav>
   <div class="unit-title">
     <h1>${esc(u.name)}</h1>
     <button class="btn ${editing ? 'primary' : ''}" data-act="toggle-edit">${editing ? 'Done' : 'Edit layout'}</button>
@@ -464,9 +496,9 @@ function unitHTML(id) {
   ${u.note ? `<p class="muted note">${esc(u.note)}</p>` : ''}
   ${editing ? `
   <div class="edit-bar">
-    <p class="small">Tap a shelf to change its tag, size or position. Tap <b>+</b> to add a shelf.</p>
+    <p class="small">Tap a shelf to change its name, size or position, or to mark it as blocked (nothing stored there). Tap <b>+</b> to add a shelf.</p>
     <div class="actions">
-      <button class="btn" data-act="edit-unit">Name, room, tag prefix…</button>
+      <button class="btn" data-act="edit-unit">Name, floor, room…</button>
       <button class="btn" data-act="add-row">+ Row</button>
       <button class="btn" data-act="del-row" ${lastRowUsed || (u.rows || 1) <= 1 ? 'disabled' : ''}>− Row</button>
       <button class="btn" data-act="add-col">+ Column</button>
@@ -476,9 +508,9 @@ function unitHTML(id) {
   <div class="unit-layout">
     <div class="unit-grid" style="--cols:${unitCols(u)}">${gridHTML(u, { edit: editing, scale: 1.7 })}</div>
     <ul class="slot-list">
-      ${slots.map(s => {
+      ${shelvesInUnit(id).map(s => {
         const n = itemsInSlot(s.id).length;
-        return `<li><a href="#/slot/${s.id}"><span class="tag-chip">${esc(s.tag)}</span><span class="grow">${esc(s.label) || '<span class="muted">No label</span>'}</span><span class="muted small">${plural(n, 'item')}</span></a></li>`;
+        return `<li><a href="#/slot/${s.id}"><span class="grow">${esc(slotName(s))}</span><span class="muted small">${plural(n, 'item')}</span></a></li>`;
       }).join('') || '<li class="empty">No shelves yet. Tap <b>Edit layout</b>, then a <b>+</b> cell.</li>'}
     </ul>
   </div>`;
@@ -486,49 +518,24 @@ function unitHTML(id) {
 
 function labelsHTML(onlySlotId) {
   const one = onlySlotId && S.slots.get(onlySlotId);
-  if (!S.labelUnits) S.labelUnits = new Set(D.units.filter(u => slotsInUnit(u.id).length).map(u => u.id));
-  const slots = one ? [one] : D.units.filter(u => S.labelUnits.has(u.id)).flatMap(u => slotsInUnit(u.id));
-  const base = location.origin + location.pathname;
+  const withShelves = D.units.filter(u => shelvesInUnit(u.id).length);
+  if (!S.labelUnits) S.labelUnits = new Set(withShelves.map(u => u.id));
+  const slots = one ? [one] : withShelves.filter(u => S.labelUnits.has(u.id)).flatMap(u => shelvesInUnit(u.id));
   return `
   <div class="noprint">
     <h1>Print labels</h1>
-    <p class="muted">Stick each label on its shelf. Scanning the QR code (with the phone camera or the scan button of the app) opens that shelf.</p>
+    <p class="muted">Stick each label on its shelf or box.</p>
     ${one ? `<p><a href="#/labels">Show all closets instead</a></p>` : `
-    <div class="chips">${D.units.filter(u => slotsInUnit(u.id).length).map(u =>
+    <div class="chips">${withShelves.map(u =>
       `<label class="chip"><input type="checkbox" data-label-unit="${u.id}" ${S.labelUnits.has(u.id) ? 'checked' : ''}> ${esc(unitLabel(u))}</label>`).join('')}</div>`}
     <div class="actions"><button class="btn primary" data-act="print">Print ${plural(slots.length, 'label')}</button></div>
   </div>
   <div class="labels">
-    ${slots.map(s => {
-      const u = S.units.get(s.unitId);
-      return `<div class="label">
-        <div class="qr" data-qr="${esc(base + '#/slot/' + s.id)}"></div>
-        <div class="ltext">
-          <div class="ltag">${esc(s.tag)}</div>
-          <div class="lunit">${esc(unitLabel(u))}</div>
-          ${s.label ? `<div class="llabel">${esc(s.label)}</div>` : ''}
-        </div>
-      </div>`;
-    }).join('')}
+    ${slots.map(s => `<div class="label">
+        <div class="lname">${esc(slotName(s))}</div>
+        <div class="lunit">${esc(slotPlace(s))}</div>
+      </div>`).join('')}
   </div>`;
-}
-
-async function fillQRCodes() {
-  const boxes = $$('.qr[data-qr]');
-  if (!boxes.length) return;
-  try { await loadScript(QRGEN_URL); } catch {
-    boxes.forEach(b => { b.textContent = 'QR needs internet'; });
-    return;
-  }
-  for (const b of boxes) {
-    const qr = window.qrcode(0, 'M');
-    qr.addData(b.dataset.qr);
-    qr.make();
-    const n = qr.getModuleCount();
-    let d = '';
-    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) d += `M${c} ${r}h1v1h-1z`;
-    b.innerHTML = `<svg viewBox="-2 -2 ${n + 4} ${n + 4}" shape-rendering="crispEdges" aria-hidden="true"><rect x="-2" y="-2" width="${n + 4}" height="${n + 4}" fill="#fff"/><path d="${d}" fill="#000"/></svg>`;
-  }
 }
 
 function settingsHTML() {
@@ -544,13 +551,20 @@ function settingsHTML() {
   <section class="card">
     <h2>Closets, drawers and boxes</h2>
     <ul class="slot-list">${D.units.map(u =>
-      `<li><a href="#/unit/${u.id}"><span class="tag-chip">${esc(u.prefix || '')}</span><span class="grow">${esc(unitLabel(u))}</span><span class="muted small">${plural(slotsInUnit(u.id).length, 'shelf').replace('shelfs', 'shelves')}</span></a></li>`).join('')}</ul>
+      `<li><a href="#/unit/${u.id}"><span class="grow">${esc(unitLabel(u))}</span><span class="muted small">${plural(shelvesInUnit(u.id).length, 'shelf').replace('shelfs', 'shelves')}</span></a></li>`).join('')}</ul>
     <div class="actions">
       <button class="btn" data-act="new-unit">+ Add a closet, drawer or box</button>
       ${D.units.length ? '' : '<button class="btn" data-act="load-seed">Load our house layout</button>'}
       <a class="btn" href="#/labels">Print labels</a>
     </div>
   </section>
+  ${D.units.length ? `
+  <section class="card">
+    <h2>Start again with our house layout</h2>
+    <p class="muted small">Deletes <b>everything</b> (all closets, shelves and ${plural(S.items.size, 'item')}) and loads the default layout:
+    first floor and second floor, with named shelves. Download a backup first if anything matters.</p>
+    <div class="actions"><button class="btn danger" data-act="reset-seed">Delete everything and load our house layout</button></div>
+  </section>` : ''}
   <section class="card">
     <h2>Backup</h2>
     <p class="muted small">Download a copy now and then. The JSON file can be restored here; the CSV opens in Excel.</p>
@@ -586,24 +600,30 @@ function openSheet(html, onClick) {
 }
 
 function pickerHTML(unitId, selectedSlotId) {
-  const u = S.units.get(unitId) || D.units.find(x => slotsInUnit(x.id).length) || D.units[0];
-  if (!u) return '<p class="muted">No closets yet.</p>';
+  const units = D.units.filter(x => shelvesInUnit(x.id).length);
+  const u = units.find(x => x.id === unitId) || units[0];
+  if (!u) return '<p class="muted">No shelves yet.</p>';
   return `
-    <select data-picker-unit aria-label="Closet">${D.units.map(x =>
+    <select data-picker-unit aria-label="Closet">${units.map(x =>
       `<option value="${x.id}" ${x.id === u.id ? 'selected' : ''}>${esc(unitLabel(x))}</option>`).join('')}</select>
+    <p class="small muted">Tap the shelf:</p>
     <div class="picker-grid" style="--cols:${unitCols(u)}">${gridHTML(u, { pick: true, highlight: selectedSlotId, scale: 1 })}</div>`;
 }
 
-function tagDatalist() {
-  return `<datalist id="tagList">${D.allSlots.map(s =>
-    `<option value="${esc(s.tag)}">${esc(slotPlace(s))}${s.label ? ' · ' + esc(s.label) : ''}</option>`).join('')}</datalist>`;
+// Editable list of the objects inside an item (e.g. a bag with 5 shirts, 3 hats).
+function contentRowHTML(c = {}) {
+  return `<li class="content-row">
+    <input class="c-qty" type="number" inputmode="numeric" min="1" step="1" value="${c.qty ?? 1}" aria-label="How many">
+    <input class="c-name" maxlength="80" value="${esc(c.name)}" placeholder="e.g. Sports shirts" autocomplete="off" aria-label="Object">
+    <button type="button" class="icon-btn small-btn" data-act="del-content" aria-label="Remove this object">×</button>
+  </li>`;
 }
 
 function openItemEditor(item, presetSlotId, presetUnitId) {
   const isNew = !item;
-  let slotId = item?.slotId || presetSlotId || (S.slots.has(S.lastSlotId) ? S.lastSlotId : '') || '';
+  const usable = id => { const s = S.slots.get(id); return s && !s.blocked ? id : ''; };
+  let slotId = usable(item?.slotId) || usable(presetSlotId) || usable(S.lastSlotId) || '';
   const photo = { thumb: item?.thumb || '', full: null, changed: false };
-  const slot = S.slots.get(slotId);
 
   const d = openSheet(`
   <form class="sheet-form" id="itemForm" novalidate>
@@ -621,11 +641,14 @@ function openItemEditor(item, presetSlotId, presetUnitId) {
     </div>
     <div class="field"><span>Where?</span>
       <div class="where-row">
-        <input name="tag" list="tagList" placeholder="Tag, e.g. A7" value="${esc(slot?.tag)}" autocomplete="off" autocapitalize="characters" aria-label="Shelf tag">
-        <button type="button" class="btn" data-act="toggle-picker">Pick on map</button>
+        <div class="where-desc grow"></div>
+        <button type="button" class="btn" data-act="toggle-picker">Change</button>
       </div>
-      <div class="where-desc small"></div>
       <div class="picker" hidden></div>
+    </div>
+    <div class="field"><span>What is inside? <small class="muted">(optional, e.g. for a bag or a box)</small></span>
+      <ul class="contents-edit">${(item?.contents || []).map(c => contentRowHTML(c)).join('')}</ul>
+      <button type="button" class="btn ghost" data-act="add-content">+ Add an object inside</button>
     </div>
     <label class="field"><span>Notes</span>
       <textarea name="notes" rows="2" maxlength="500" placeholder="Optional: size, colour, who it belongs to…">${esc(item?.notes)}</textarea></label>
@@ -645,33 +668,43 @@ function openItemEditor(item, presetSlotId, presetUnitId) {
       <button type="submit" class="btn primary">Save</button>
     </footer>
     <datalist id="catList">${D.categories.map(c => `<option value="${esc(c)}">`).join('')}</datalist>
-    ${tagDatalist()}
   </form>`, onClick);
 
   const f = $('#itemForm', d);
   const err = $('.error', f);
   const picker = $('.picker', f);
   const desc = $('.where-desc', f);
+  const contentsList = $('.contents-edit', f);
 
   function showWhere() {
     const s = S.slots.get(slotId);
     desc.innerHTML = s
-      ? `<span class="tag-chip">${esc(s.tag)}</span>${esc(slotPlace(s))}${s.label ? ' · ' + esc(s.label) : ''}`
-      : (f.tag.value.trim() ? '<span class="error-text">Unknown tag</span>' : '<span class="muted">Type the tag written on the shelf, or pick it on the map.</span>');
+      ? `<b>${esc(slotName(s))}</b><br><span class="muted small">${esc(slotPlace(s))}</span>`
+      : '<span class="muted">Choose the shelf on the map below.</span>';
+    $('[data-act="toggle-picker"]', f).textContent = picker.hidden ? 'Change' : 'Hide map';
   }
   function renderPicker(unitId) {
     picker.innerHTML = pickerHTML(unitId, slotId);
   }
+  function readContents() {
+    return $$('.content-row', contentsList)
+      .map(li => ({ name: $('.c-name', li).value.trim(), qty: Math.max(1, intOr($('.c-qty', li).value, 1)) }))
+      .filter(c => c.name);
+  }
+  // No shelf chosen yet: show the map straight away.
+  if (!slotId) { picker.hidden = false; renderPicker(presetUnitId); }
   showWhere();
 
-  f.tag.addEventListener('input', () => {
-    const s = D.slotByTag.get(norm(f.tag.value));
-    slotId = s ? s.id : '';
-    showWhere();
-    if (!picker.hidden && s) renderPicker(s.unitId);
-  });
   picker.addEventListener('change', e => {
     if (e.target.matches('[data-picker-unit]')) renderPicker(e.target.value);
+  });
+  // Enter in an object's name adds the next object instead of saving the whole item.
+  contentsList.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' || !e.target.matches('.c-name, .c-qty')) return;
+    e.preventDefault();
+    if (e.target.matches('.c-qty')) { $('.c-name', e.target.closest('.content-row')).focus(); return; }
+    contentsList.insertAdjacentHTML('beforeend', contentRowHTML());
+    $('.content-row:last-child .c-name', contentsList).focus();
   });
   f.photo.addEventListener('change', async () => {
     const file = f.photo.files[0];
@@ -696,15 +729,20 @@ function openItemEditor(item, presetSlotId, presetUnitId) {
     const pick = e.target.closest('[data-pick]');
     if (pick) {
       slotId = pick.dataset.pick;
-      f.tag.value = S.slots.get(slotId)?.tag || '';
-      showWhere();
       picker.hidden = true;
+      showWhere();
       return;
     }
     const act = e.target.closest('[data-act]')?.dataset.act;
     if (act === 'toggle-picker') {
       picker.hidden = !picker.hidden;
       if (!picker.hidden) renderPicker(S.slots.get(slotId)?.unitId || presetUnitId);
+      showWhere();
+    } else if (act === 'add-content') {
+      contentsList.insertAdjacentHTML('beforeend', contentRowHTML());
+      $('.content-row:last-child .c-name', contentsList).focus();
+    } else if (act === 'del-content') {
+      e.target.closest('.content-row').remove();
     } else if (act === 'remove-photo') {
       photo.thumb = ''; photo.full = null; photo.changed = true;
       $('.photo-preview', f).hidden = true;
@@ -723,13 +761,18 @@ function openItemEditor(item, presetSlotId, presetUnitId) {
     const qty = Math.max(0, intOr(f.qty.value, 1));
     err.hidden = true;
     if (!name) { err.textContent = 'Write what it is.'; err.hidden = false; f.itemName.focus(); return; }
-    if (!S.slots.has(slotId)) { err.textContent = 'Choose where it is (a valid tag or pick it on the map).'; err.hidden = false; return; }
+    if (!usable(slotId)) {
+      err.textContent = 'Choose where it is: tap its shelf on the map.'; err.hidden = false;
+      if (picker.hidden) { picker.hidden = false; renderPicker(presetUnitId); showWhere(); }
+      return;
+    }
 
     const id = item?.id || store.newId();
     const data = {
       name, qty,
       category: f.category.value.trim(),
       notes: f.notes.value.trim(),
+      contents: readContents(),
       slotId,
       ...stamp(),
     };
@@ -745,10 +788,11 @@ function openItemEditor(item, presetSlotId, presetUnitId) {
     write(ops);
     S.lastSlotId = slotId;
 
-    const where = S.slots.get(slotId)?.tag;
+    const where = slotName(S.slots.get(slotId));
     if (again) {
       toast(`Saved “${name}” in ${where}`);
       f.itemName.value = ''; f.qty.value = 1; f.notes.value = '';
+      contentsList.innerHTML = '';
       photo.thumb = ''; photo.full = null; photo.changed = false;
       $('.photo-preview', f).hidden = true;
       $('[data-act="remove-photo"]', f).hidden = true;
@@ -790,11 +834,10 @@ function openSlotEditor(slot) {
   const n = itemsInSlot(slot.id).length;
   const d = openSheet(`
   <form class="sheet-form" id="slotForm" novalidate>
-    <header class="sheet-head"><h2>Shelf ${esc(slot.tag)}</h2><button type="button" class="icon-btn" data-close aria-label="Close">×</button></header>
-    <div class="field-row">
-      <label class="field"><span>Tag (on the label)</span><input name="tag" required maxlength="12" value="${esc(slot.tag)}" autocapitalize="characters"></label>
-      <label class="field grow"><span>Label</span><input name="label" maxlength="60" value="${esc(slot.label)}" placeholder="e.g. Winter clothes"></label>
-    </div>
+    <header class="sheet-head"><h2>${esc(slotName(slot))}</h2><button type="button" class="icon-btn" data-close aria-label="Close">×</button></header>
+    <label class="field"><span>Name</span><input name="slotName" required maxlength="60" value="${esc(slotName(slot))}" placeholder="e.g. Winter clothes"></label>
+    <label class="check"><input type="checkbox" name="blocked" ${slot.blocked ? 'checked' : ''} ${n ? 'disabled' : ''}>
+      Blocked: nothing is stored here (e.g. hanging jackets)</label>
     <p class="small muted">Position in the grid (row 1 = top, column 1 = left). A shelf can span several cells.</p>
     <div class="field-row four">
       <label class="field"><span>Row</span><input name="row" type="number" min="1" inputmode="numeric" value="${slot.row}"></label>
@@ -810,17 +853,17 @@ function openSlotEditor(slot) {
     <label class="field"><span>Note</span><input name="note" maxlength="120" value="${esc(slot.note)}" placeholder="e.g. box type, fragile…"></label>
     <p class="error" hidden></p>
     <footer class="sheet-foot">
-      <button type="button" class="btn danger" data-act="delete-slot" ${n ? `disabled title="Move its ${plural(n, 'item')} first"` : ''}>Delete shelf</button>
+      <button type="button" class="btn danger" data-act="delete-slot" ${n ? `disabled title="Move its ${plural(n, 'item')} first"` : ''}>Delete</button>
       <span class="spacer"></span>
       <button type="submit" class="btn primary">Save</button>
     </footer>
-    ${n ? `<p class="small muted">This shelf has ${plural(n, 'item')}; move them before deleting it.</p>` : ''}
+    ${n ? `<p class="small muted">This shelf has ${plural(n, 'item')}; move them before deleting it or blocking it.</p>` : ''}
   </form>`, e => {
     if (e.target.closest('[data-act="delete-slot"]')) {
-      if (!confirm(`Delete shelf ${slot.tag}?`)) return;
+      if (!confirm(`Delete “${slotName(slot)}”?`)) return;
       write([{ op: 'delete', coll: 'slots', id: slot.id }]);
       d.close();
-      toast(`Deleted ${slot.tag}`);
+      toast(`Deleted ${slotName(slot)}`);
     }
   });
 
@@ -828,23 +871,21 @@ function openSlotEditor(slot) {
   const err = $('.error', f);
   f.addEventListener('submit', e => {
     e.preventDefault();
-    const tag = f.tag.value.trim().toUpperCase();
+    const name = f.slotName.value.trim();
     const pos = {
       row: Math.max(1, intOr(f.row.value, 1)), col: Math.max(1, intOr(f.col.value, 1)),
       rowSpan: Math.max(1, intOr(f.rowSpan.value, 1)), colSpan: Math.max(1, intOr(f.colSpan.value, 1)),
     };
     const fail = m => { err.textContent = m; err.hidden = false; };
-    if (!tag) return fail('The tag cannot be empty.');
-    const clash = D.slotByTag.get(norm(tag));
-    if (clash && clash.id !== slot.id) return fail(`Tag ${tag} is already used in ${slotPlace(clash)}.`);
+    if (!name) return fail('The name cannot be empty.');
     const over = slotsInUnit(u.id).find(o => o.id !== slot.id
       && pos.row < o.row + (o.rowSpan || 1) && o.row < pos.row + pos.rowSpan
       && pos.col < o.col + (o.colSpan || 1) && o.col < pos.col + pos.colSpan);
-    if (over) return fail(`That position overlaps shelf ${over.tag}.`);
+    if (over) return fail(`That position overlaps “${slotName(over)}”.`);
 
     const ops = [{
       op: 'update', coll: 'slots', id: slot.id,
-      data: { tag, label: f.label.value.trim(), ...pos, h: numOrNull(f.h.value), w: numOrNull(f.w.value), d: numOrNull(f.d.value), note: f.note.value.trim() },
+      data: { name, blocked: f.blocked.checked, ...pos, h: numOrNull(f.h.value), w: numOrNull(f.w.value), d: numOrNull(f.d.value), note: f.note.value.trim() },
     }];
     const rows = Math.max(u.rows || 1, pos.row + pos.rowSpan - 1);
     const cols = Math.max(u.cols || 1, pos.col + pos.colSpan - 1);
@@ -855,47 +896,44 @@ function openSlotEditor(slot) {
   });
 }
 
-function nextTag(u) {
-  const prefix = u.prefix || '';
-  let n = 0;
-  for (const s of slotsInUnit(u.id)) {
-    const m = String(s.tag).match(/(\d+)$/);
-    if (m && String(s.tag).toUpperCase().startsWith(prefix.toUpperCase())) n = Math.max(n, +m[1]);
-  }
-  let tag;
-  do { tag = `${prefix}${++n}`; } while (D.slotByTag.has(norm(tag)));
-  return tag;
+// "Shelf N" with the first N not used in this closet.
+function nextShelfName(u) {
+  const used = new Set(slotsInUnit(u.id).map(s => norm(slotName(s))));
+  let n = 1;
+  while (used.has(`shelf ${n}`)) n++;
+  return `Shelf ${n}`;
 }
 
 function addSlotAt(u, row, col) {
-  const siblings = slotsInUnit(u.id);
+  const siblings = shelvesInUnit(u.id);
   const sameRow = siblings.find(s => s.row === row && s.h);
   const any = siblings.find(s => s.w || s.d);
-  const tag = nextTag(u);
+  const name = nextShelfName(u);
   write([{
     op: 'set', coll: 'slots', id: store.newId(),
-    data: { unitId: u.id, tag, label: '', row, col, rowSpan: 1, colSpan: 1, h: sameRow?.h ?? null, w: any?.w ?? null, d: any?.d ?? null, note: '' },
+    data: { unitId: u.id, name, blocked: false, row, col, rowSpan: 1, colSpan: 1, h: sameRow?.h ?? null, w: any?.w ?? null, d: any?.d ?? null, note: '' },
   }]);
-  toast(`Added shelf ${tag}`);
+  toast(`Added ${name}. Tap it to rename it.`);
 }
 
 function openUnitEditor(unit) {
   const isNew = !unit;
-  const rooms = [...D.rooms.keys()];
+  const floors = [...new Set(['First floor', 'Second floor', ...D.floors.keys()])];
+  const rooms = [...new Set([...D.floors.values()].flatMap(r => [...r.keys()]))].sort(natural);
   const n = unit ? itemsInUnit(unit.id) : 0;
   const d = openSheet(`
   <form class="sheet-form" id="unitForm" novalidate>
     <header class="sheet-head"><h2>${isNew ? 'New closet, drawer or box' : 'Closet details'}</h2><button type="button" class="icon-btn" data-close aria-label="Close">×</button></header>
     <label class="field"><span>Name</span><input name="unitName" required maxlength="40" value="${esc(unit?.name)}" placeholder="e.g. Hall closet"></label>
     <div class="field-row">
-      <label class="field grow"><span>Room</span><input name="room" list="roomList" maxlength="40" value="${esc(unit?.room)}" placeholder="e.g. Hallway"></label>
-      <label class="field"><span>Tag prefix</span><input name="tagPrefix" maxlength="6" value="${esc(unit?.prefix)}" placeholder="e.g. C" autocapitalize="characters"></label>
+      <label class="field"><span>Floor</span><input name="floor" list="floorList" maxlength="40" value="${esc(unit?.floor)}" placeholder="e.g. First floor"></label>
+      <label class="field grow"><span>Room</span><input name="room" list="roomList" maxlength="40" value="${esc(unit?.room)}" placeholder="e.g. Hall"></label>
     </div>
     <div class="field-row">
       <label class="field"><span>Columns</span><input name="cols" type="number" min="1" max="20" inputmode="numeric" value="${unit?.cols ?? 1}"></label>
       <label class="field"><span>Rows</span><input name="rows" type="number" min="1" max="30" inputmode="numeric" value="${unit?.rows ?? 4}"></label>
     </div>
-    ${isNew ? `<label class="check"><input type="checkbox" name="fill" checked> Create a shelf in every cell now (tags prefix1, prefix2…)</label>` : ''}
+    ${isNew ? `<label class="check"><input type="checkbox" name="fill" checked> Create a shelf in every cell now (Shelf 1, Shelf 2…)</label>` : ''}
     <label class="field"><span>Note</span><input name="note" maxlength="160" value="${esc(unit?.note)}"></label>
     <p class="error" hidden></p>
     <footer class="sheet-foot">
@@ -904,6 +942,7 @@ function openUnitEditor(unit) {
       <button type="submit" class="btn primary">${isNew ? 'Create' : 'Save'}</button>
     </footer>
     ${n ? `<p class="small muted">It contains ${plural(n, 'item')}: move them before deleting it.</p>` : ''}
+    <datalist id="floorList">${floors.map(x => `<option value="${esc(x)}">`).join('')}</datalist>
     <datalist id="roomList">${rooms.map(r => `<option value="${esc(r)}">`).join('')}</datalist>
   </form>`, e => {
     if (e.target.closest('[data-act="delete-unit"]')) {
@@ -921,8 +960,8 @@ function openUnitEditor(unit) {
     const err = $('.error', f);
     const data = {
       name: f.unitName.value.trim(),
+      floor: f.floor.value.trim() || 'Other',
       room: f.room.value.trim() || 'Other',
-      prefix: f.tagPrefix.value.trim().toUpperCase(),
       cols: Math.min(20, Math.max(1, intOr(f.cols.value, 1))),
       rows: Math.min(30, Math.max(1, intOr(f.rows.value, 1))),
       note: f.note.value.trim(),
@@ -933,14 +972,10 @@ function openUnitEditor(unit) {
       data.order = Math.max(0, ...D.units.map(u => u.order ?? 0)) + 1;
       const ops = [{ op: 'set', coll: 'units', id, data }];
       if (f.fill.checked) {
-        const used = new Set(D.slotByTag.keys());
         let k = 0;
         for (let r = 1; r <= data.rows; r++) {
           for (let c = 1; c <= data.cols; c++) {
-            let tag;
-            do { tag = `${data.prefix}${++k}`; } while (used.has(norm(tag)));
-            used.add(norm(tag));
-            ops.push({ op: 'set', coll: 'slots', id: store.newId(), data: { unitId: id, tag, label: '', row: r, col: c, rowSpan: 1, colSpan: 1, h: null, w: null, d: null, note: '' } });
+            ops.push({ op: 'set', coll: 'slots', id: store.newId(), data: { unitId: id, name: `Shelf ${++k}`, blocked: false, row: r, col: c, rowSpan: 1, colSpan: 1, h: null, w: null, d: null, note: '' } });
           }
         }
       }
@@ -961,18 +996,18 @@ function openMoveAll(fromSlot) {
   const items = itemsInSlot(fromSlot.id);
   const d = openSheet(`
   <div class="sheet-form">
-    <header class="sheet-head"><h2>Move ${plural(items.length, 'item')} from ${esc(fromSlot.tag)}</h2><button type="button" class="icon-btn" data-close aria-label="Close">×</button></header>
+    <header class="sheet-head"><h2>Move ${plural(items.length, 'item')} from ${esc(slotName(fromSlot))}</h2><button type="button" class="icon-btn" data-close aria-label="Close">×</button></header>
     <p class="muted small">Tap the shelf where everything goes (e.g. when a whole box changes place).</p>
     <div class="picker">${pickerHTML(fromSlot.unitId, fromSlot.id)}</div>
   </div>`, e => {
     const pick = e.target.closest('[data-pick]');
     if (!pick || pick.dataset.pick === fromSlot.id) return;
     const to = S.slots.get(pick.dataset.pick);
-    if (!confirm(`Move ${plural(items.length, 'item')} from ${fromSlot.tag} to ${to.tag}?`)) return;
+    if (!confirm(`Move ${plural(items.length, 'item')} from “${slotName(fromSlot)}” to “${fullPlace(to)}”?`)) return;
     const st = stamp();
     write(items.map(it => ({ op: 'update', coll: 'items', id: it.id, data: { slotId: to.id, ...st } })));
     d.close();
-    toast(`Moved to ${to.tag}`, {
+    toast(`Moved to ${slotName(to)}`, {
       label: 'Undo',
       run: () => write(items.map(it => ({ op: 'update', coll: 'items', id: it.id, data: { slotId: fromSlot.id, ...stamp() } }))),
     });
@@ -994,81 +1029,25 @@ async function openPhoto(item) {
   } catch { /* offline and not cached: keep the thumbnail */ }
 }
 
-// ---------------------------------------------------------------- scanner
+// ---------------------------------------------------------------- start again
 
-let scanStream = null;
-let scanTimer = null;
-let lastBadScan = '';
-
-async function openScanner() {
-  if (!navigator.mediaDevices?.getUserMedia) { toast('The camera is not available here'); return; }
-  const box = $('#scanner');
-  const video = $('#scanVideo');
-  box.hidden = false;
-  try {
-    scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
-  } catch {
-    box.hidden = true;
-    toast('No permission to use the camera');
-    return;
-  }
-  video.srcObject = scanStream;
-  await video.play().catch(() => {});
-
-  let detector = null;
-  if ('BarcodeDetector' in window) {
-    try { detector = new window.BarcodeDetector({ formats: ['qr_code'] }); } catch { detector = null; }
-  }
-  if (!detector) {
-    try { await loadScript(JSQR_URL); } catch { closeScanner(); toast('The scanner needs internet the first time'); return; }
-  }
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-
-  const tick = async () => {
-    if (!scanStream) return;
-    if (video.readyState >= 2) {
-      let text = null;
-      try {
-        if (detector) {
-          const codes = await detector.detect(video);
-          text = codes[0]?.rawValue || null;
-        } else if (window.jsQR) {
-          const k = Math.min(1, 720 / Math.max(video.videoWidth, video.videoHeight));
-          canvas.width = Math.round(video.videoWidth * k);
-          canvas.height = Math.round(video.videoHeight * k);
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-          text = window.jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' })?.data || null;
-        }
-      } catch { /* try again on the next frame */ }
-      if (text && handleScan(text)) return;
-    }
-    scanTimer = setTimeout(tick, 200);
-  };
-  tick();
-}
-
-function closeScanner() {
-  clearTimeout(scanTimer);
-  if (scanStream) scanStream.getTracks().forEach(t => t.stop());
-  scanStream = null;
-  $('#scanVideo').srcObject = null;
-  $('#scanner').hidden = true;
-}
-
-function handleScan(text) {
-  const m = text.match(/#\/slot\/([A-Za-z0-9_-]+)/);
-  const slot = (m && S.slots.get(m[1])) || D.slotByTag.get(norm(text));
-  if (!slot) {
-    if (text !== lastBadScan) toast('That QR is not a shelf of this inventory');
-    lastBadScan = text;
-    return false;
-  }
-  closeScanner();
-  clearSearch();
-  location.hash = '#/slot/' + slot.id;
-  return true;
+// Deletes every closet, shelf, item and photo, then loads the default house layout.
+function resetToSeed() {
+  const n = S.items.size;
+  if (!confirm(`Delete EVERYTHING (${plural(D.units.length, 'closet')}, ${plural(S.slots.size, 'shelf').replace('shelfs', 'shelves')}, ${plural(n, 'item')}) and load our house layout?`)) return;
+  if (n && !confirm(`Really? The ${plural(n, 'item')} will be lost for both of you.`)) return;
+  const ops = [
+    ...[...S.items.values()].flatMap(it => [
+      { op: 'delete', coll: 'items', id: it.id },
+      ...(it.hasPhoto ? [{ op: 'delete', coll: 'photos', id: it.id }] : []),
+    ]),
+    ...[...S.slots.keys()].map(id => ({ op: 'delete', coll: 'slots', id })),
+    ...[...S.units.keys()].map(id => ({ op: 'delete', coll: 'units', id })),
+    ...buildSeed(() => store.newId(), 0),
+  ];
+  write(ops);
+  location.hash = '#/';
+  toast('House layout loaded');
 }
 
 // ---------------------------------------------------------------- backup
@@ -1076,7 +1055,7 @@ function handleScan(text) {
 function exportJSON() {
   const strip = m => [...m.values()];
   const payload = {
-    app: 'home-inventory', version: 1, exportedAt: new Date().toISOString(),
+    app: 'home-inventory', version: 2, exportedAt: new Date().toISOString(),
     units: strip(S.units), slots: strip(S.slots), items: strip(S.items),
   };
   download(`inventory-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 1), 'application/json');
@@ -1084,11 +1063,11 @@ function exportJSON() {
 
 function exportCSV() {
   const cell = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const head = ['Item', 'Quantity', 'Category', 'Tag', 'Shelf label', 'Closet', 'Room', 'Notes', 'Last change', 'Changed by'];
+  const head = ['Item', 'Quantity', 'Category', 'Inside', 'Shelf', 'Closet', 'Room', 'Floor', 'Notes', 'Last change', 'Changed by'];
   const rows = [...S.items.values()].sort((a, b) => natural(a.name, b.name)).map(it => {
     const s = S.slots.get(it.slotId);
     const u = s && S.units.get(s.unitId);
-    return [it.name, it.qty ?? 1, it.category, s?.tag, s?.label, u?.name, u?.room, it.notes,
+    return [it.name, it.qty ?? 1, it.category, contentsText(it), s && slotName(s), u?.name, u?.room, u?.floor, it.notes,
       it.updatedAt ? new Date(it.updatedAt).toLocaleString() : '', who(it.updatedBy)];
   });
   // Semicolons + BOM: opens correctly in Excel with Spanish regional settings.
@@ -1182,6 +1161,7 @@ document.addEventListener('click', e => {
       toast('House layout loaded');
       break;
     }
+    case 'reset-seed': resetToSeed(); break;
     case 'print': window.print(); break;
     case 'export-json': exportJSON(); break;
     case 'export-csv': exportCSV(); break;
@@ -1197,9 +1177,12 @@ document.addEventListener('click', e => {
 
 document.addEventListener('change', e => {
   const t = e.target;
-  if (t.matches('[data-field="slot-label"]')) {
+  if (t.matches('[data-field="slot-name"]')) {
     const s = S.slots.get(t.dataset.id);
-    if (s && s.label !== t.value.trim()) write([{ op: 'update', coll: 'slots', id: s.id, data: { label: t.value.trim() } }]);
+    const name = t.value.trim();
+    if (!s) return;
+    if (!name) { t.value = slotName(s); return; }   // a shelf always keeps a name
+    if (name !== s.name) { write([{ op: 'update', coll: 'slots', id: s.id, data: { name } }]); toast('Name saved'); }
   } else if (t.matches('[data-label-unit]')) {
     t.checked ? S.labelUnits.add(t.dataset.labelUnit) : S.labelUnits.delete(t.dataset.labelUnit);
     render(true);
@@ -1210,7 +1193,7 @@ document.addEventListener('change', e => {
 });
 
 document.addEventListener('keydown', e => {
-  if (e.target.matches('[data-field="slot-label"]') && e.key === 'Enter') e.target.blur();
+  if (e.target.matches('[data-field="slot-name"]') && e.key === 'Enter') e.target.blur();
   if (e.key === '/' && !e.target.closest('input, textarea, select, dialog')) { e.preventDefault(); $('#q').focus(); }
 });
 
@@ -1240,19 +1223,13 @@ q.addEventListener('input', () => {
 });
 q.addEventListener('keydown', e => {
   if (e.key === 'Escape') { clearSearch(); render(true); q.blur(); }
-  if (e.key === 'Enter') {
-    const s = D.slotByTag?.get(norm(q.value));
-    if (s) { clearSearch(); q.blur(); location.hash = '#/slot/' + s.id; }
-    else q.blur();
-  }
+  if (e.key === 'Enter') q.blur();   // hides the phone keyboard to see the results
 });
 $('#qclear').addEventListener('click', () => { clearSearch(); render(true); q.focus(); });
 $('#fab').addEventListener('click', () => {
   const r = route();
   openItemEditor(null, currentSlotId(), r.name === 'unit' ? r.id : null);
 });
-$('#scanBtn').addEventListener('click', openScanner);
-$('#scanClose').addEventListener('click', closeScanner);
 
 window.addEventListener('hashchange', () => {
   const r = route();
