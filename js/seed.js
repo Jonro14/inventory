@@ -30,12 +30,12 @@ const LAYOUT = [
   // ---------------- first floor
   {
     floor: FIRST, room: 'Storage room', name: 'Storage closet', cols: 4, rows: 5, w: 40, d: 50,
-    note: 'Almacén. The middle-right space holds hanging jackets (not listed).',
+    note: 'Almacén. Columns 3-4, rows 2-4 hold hanging jackets (not listed).',
     slots: [
       S(1, 1, { h: 33 }), S(1, 2, { h: 33 }), S(1, 3, { h: 33 }), S(1, 4, { h: 33 }),
-      S(2, 1, { h: 33 }), S(2, 2, { h: 33 }), BLOCK(2, 3, 2, 2),
+      S(2, 1, { h: 33 }), S(2, 2, { h: 33 }), BLOCK(2, 3, 3, 2),
       S(3, 1, { h: 30 }), S(3, 2, { h: 30 }),
-      S(4, 1, { h: 30 }), S(4, 2, { h: 30 }), S(4, 3, { h: 30 }), S(4, 4, { h: 20 }),
+      S(4, 1, { h: 30 }), S(4, 2, { h: 30 }),
       S(5, 1, { h: 20 }), S(5, 2, { h: 20 }), S(5, 3, { h: 20 }), S(5, 4, { h: 20 }),
     ],
   },
@@ -43,18 +43,18 @@ const LAYOUT = [
   bathroomCloset('Bathroom 1'),
   {
     floor: FIRST, room: 'Bedroom', name: 'Bedroom closet', cols: 2, rows: 5, w: 40, d: 50,
-    note: 'Habitación. Left column 5 shelves; right column 2 up, 2 down and hanging jackets in the middle (not listed).',
+    note: 'Habitación. Left column 5 shelves; right column 1 up, 1 down and hanging jackets in rows 2-4 (not listed).',
     slots: [
       ...column(5, 1, { h: 33 }),
-      S(1, 2, { h: 33 }), S(2, 2, { h: 33 }), BLOCK(3, 2), S(4, 2, { h: 40 }), S(5, 2, { h: 40 }),
+      S(1, 2, { h: 40 }), BLOCK(2, 2, 3, 1), S(5, 2, { h: 40 }),
     ],
   },
   { floor: FIRST, room: 'Hall', name: 'Memories box', cols: 1, rows: 1, note: 'Big plastic box.', slots: [S(1, 1, { name: 'Memories box' })] },
 
   // ---------------- second floor
   { floor: SECOND, room: 'Hall', name: 'Vertical drawers', cols: 1, rows: 4, base: 'Drawer', note: 'Sizes to be measured.', slots: column(4) },
-  { floor: SECOND, room: 'Bedroom', name: 'Walk-in room', cols: 1, rows: 3, slots: column(3) },
-  { floor: SECOND, room: 'Master bedroom', name: 'Closet', cols: 2, rows: 3, slots: [...column(3, 1), ...column(3, 2)] },
+  { floor: SECOND, room: 'Bedroom', name: 'Walk-in room', cols: 3, rows: 4, slots: [], note: 'Empty for now. Tap "Edit layout" and the + cells to add shelves.' },
+  { floor: SECOND, room: 'Master bedroom', name: 'Closet', cols: 2, rows: 4, slots: [...column(4, 1), ...column(4, 2)] },
   { floor: SECOND, room: 'Master bedroom', name: 'Walk-in room', cols: 3, rows: 4, slots: [], note: 'Empty for now. Tap "Edit layout" and the + cells to add shelves.' },
   bathroomCloset('Master bathroom'),
   bathroomCloset('Shower'),
